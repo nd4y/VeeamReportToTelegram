@@ -1,13 +1,15 @@
-$error.Clear()
 #region Functions
+$error.Clear()
 function Get-VBRLatestRestorePointDate { # Получает дату последней точки восстановления
     param (
         [Parameter(Mandatory = $true, Position = 0)]
-        [System.String] $VBRBackupName,
+        [System.String]
+        $VBRBackupName,
 
         [Parameter(Mandatory = $true, Position = 1)]
-        [ValidateSet('VMware Backup', 'File Backup')] # Другие типы бекапов добавлю по мере необходимости
-        [System.String] $VBRBackupType
+        [ValidateSet('VMware Backup', 'File Backup', 'Linux Agent Backup')] # Другие типы бекапов добавлю по мере необходимости
+        [System.String]
+        $VBRBackupType
     )
 
     $InputDateFormat = 'MM/d/yyyy h:mm:ss tt'
@@ -36,6 +38,19 @@ function Get-VBRLatestRestorePointDate { # Получает дату после�
         }
     }
 
+   
+    if ($VBRBackupType -eq 'Linux Agent Backup') {  # Выводит дату последнего запуска джобы бекапа, даже если бекап был создан неудачно. Вероятно, в интерфейсе Veeam Console это тоже работает по этому принципу.
+                                                    #  Это не работает https://helpcenter.veeam.com/docs/backup/powershell/get-vbrrestorepoint.html?ver=110
+        $result = try {
+            Get-Date(
+                (Get-VBRJob -Name $VBRBackupName).FindLastSession().CreationTime
+            )
+        }
+        catch {
+            'No restore points'
+        }
+    }
+
     return $result
     
 }
@@ -58,11 +73,13 @@ function Get-VBRRecoveryPointObjective { #Выводит округленное 
 function Add-EmojiAtTheBegginingOfTheString { #Добавляет URL encoded Emoji для Telegram
     param (
         [Parameter(Mandatory = $true, Position = 0)]
-        [String] $String,
+        [String]
+        $String,
 
         [Parameter(Mandatory = $true, Position = 1)]
         [ValidateSet('Green', 'Yellow', 'Red')]
-        [String] $Color
+        [String]
+        $Color
         )
         
     $EmojiMap = @{
@@ -78,17 +95,19 @@ function Add-EmojiAtTheBegginingOfTheString { #Добавляет URL encoded Em
 function Send-MessageToTelegramChatViaBot { # Отправляет сообщение в телеграм. 
     param (
         [Parameter(Mandatory = $true, Position = 0)]
-        [String] $BotToken,
+        [String]
+        $BotToken,
         [Parameter(Mandatory = $true, Position = 1)]
-        [String] $ChatId,
+        [String]
+        $ChatId,
         [Parameter(Mandatory = $true, Position = 2)]
-        [String] $Message,
+        [String]
+        $Message,
         [Parameter(Mandatory = $false, Position = 3)]
-        [String] $ParseMode = 'html',
-        [Parameter(Mandatory = $false, Position = 4)]
-        [int] $Attempts = '3', # Количество попыток отправки сообщения
-        [Parameter(Mandatory = $false, Position = 5)]
-        [int] $Timeout = '10' # Таймаут между попытками в секундах
+        [String]
+        $ParseMode = 'html'
+
+
     )
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -103,11 +122,11 @@ function Send-MessageToTelegramChatViaBot { # Отправляет сообще�
         catch {
             $ErrorLog = $_
             $Failed = $true
-            Start-Sleep -Seconds $Timeout
+            Start-Sleep -Seconds 10
         }
     } 
     while (
-        $Failed -and ($i -lt $Attempts)
+        $Failed -and ($i -lt 3)
         )
         
     if ($Failed) {
@@ -138,16 +157,14 @@ function Get-FormattedDate { # Конвертирует дату из datetime �
 function Get-FormattedRPO { # Конвертирует значение RPO в строку с Emoji
     Param(
         [Parameter(Mandatory = $true, Position = 0)]
-        [int] $RPO
+        [int]
+        $RPO,
+        [Parameter(Mandatory = $true, Position = 1)]
+        [hashtable]
+        $RPOMap
     )
-        
-    $RPOMap = [ordered]@{
-        '24'        = 'Green'
-        '48'        = 'Yellow'
-        #'999999'    = 'Red'
-    }
 
-    foreach ($Element in $RPOMap.GetEnumerator()) {
+    foreach ($Element in ($RPOMap.GetEnumerator() | Sort-Object -Property 'Key')) {
         if ($RPO -le $Element.Key) {
             $Color = $Element.Value
             break
@@ -164,7 +181,8 @@ function Get-FormattedRPO { # Конвертирует значение RPO в �
 function Get-FormattedLastResult { # Конвертирует значение статуса в строку с Emoji
     Param(
         [Parameter(Mandatory = $true, Position = 0)]
-        [String] $LastResult
+        [String]
+        $LastResult
     )
         
     $LastResultsMap = [ordered]@{
@@ -188,19 +206,68 @@ function Get-FormattedLastResult { # Конвертирует значение �
     return $result
     
 } 
+function Get-VBRJobTotalBackupSize { # Расчитывает значение размеров всех Restore Points в рамках одной Backup Job. Возвращает значение в [int] в байтах. Работает неправильно, если есть две джобы где одна джоба полностью включает в себя часть названия другой джобы.
+    Param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [String]
+        $VBRBackupJobName,
+        [Parameter(Mandatory = $true, Position = 1)]
+        [String]
+        $VBRBackupType
+    )
+
+    if ($VBRBackupType -eq 'File Backup') {
+        $result = try {
+            (Get-VBRJob -Name $VBRBackupJobName).FindLastSession().Info.BackupTotalSize
+        }
+        catch {
+            $_
+        }
+    }
+
+
+    else {
+        $result = try {
+            (((Get-VBRBackup -Name "$VBRBackupJobName*").GetAllStorages().Stats.BackupSize) | Measure-Object -Sum).Sum
+        }
+        catch {
+            $_
+        }
+    }
+    return $result 
+}
 #endregion Functions
 
+#Main Script        
+$RPOMap = [ordered]@{ # Максимально допустимое время в часах для получения зеленого, желтого или красного значка напротив значения RPO. Красный значек используется, если не выполняются условия для зеленого или желтого.
+    '24'        = 'Green'
+    '48'        = 'Yellow'
+    #'999999'    = 'Red'
+}
 
 $BackupStatistics = @()
 Get-VBRJob | ForEach-Object {
 
+    #region Custom RPO Settings
+    $CustomRPOMap = @( # Переопределение дефолтного RPO (24 часа) для некоторых видов бекапов
+        [PSCustomObject]@{JobName = 'Custom Backup';   RPOMap = [ordered]@{'168' = 'Green'; '336' = 'Yellow'}}
+        [PSCustomObject]@{JobName = 'Custom 2 Backup'; RPOMap = [ordered]@{'9998' = 'Green'; '9999' = 'Yellow'}}
+    )
+
+    foreach ($Element in $CustomRPOMap) {
+        if ($_.Name -eq $Element.JobName) {
+            $RPOMap = $Element.RPOMap
+        }
+    }
+    #endregion Custom RPO Settings
+
     $BackupStatistics += [PSCustomObject]@{
         'Name'                        = $_.Name 
-        'RPO'                         = Get-FormattedRPO -RPO (Get-VBRRecoveryPointObjective -LatestRestorePointDate (Get-VBRLatestRestorePointDate -VBRBackupName $_.Name -VBRBackupType $_.TypeToString))
+        'RPO'                         = Get-FormattedRPO -RPO (Get-VBRRecoveryPointObjective -LatestRestorePointDate (Get-VBRLatestRestorePointDate -VBRBackupName $_.Name -VBRBackupType $_.TypeToString)) -RPOMap $RPOMap
         'Job status'                  = $_.GetLastState()
-        'Latest result'               = Get-FormattedLastResult -LastResult ($_.Info.LatestStatus)
+        'Last result'                 = Get-FormattedLastResult -LastResult ($_.Info.LatestStatus)
         'Latest restore point'        = Get-FormattedDate -InputDate (Get-VBRLatestRestorePointDate -VBRBackupName $_.Name -VBRBackupType $_.TypeToString)
-        'Total backup size'           = "$([math]::round((((Get-VBRJob -Name $_.Name).FindLastSession().Info.BackupTotalSize)/1GB)))GB"
+        'Total backup size'           = "$([math]::round((Get-VBRJobTotalBackupSize -VBRBackupJobName $_.Name -VBRBackupType $_.TypeToString)/1GB))GB"
     }
 
 }
@@ -208,4 +275,5 @@ $BackupStatistics
 $Header  = 'Veeam backup report for ' + (Get-FormattedDate -InputDate (Get-Date))
 $Tail    = '[DEBUG] Number of data processing errors: ' + $error.Count 
 $Message = $Header + '<pre>' + $($BackupStatistics | Sort-Object -Property 'Name' | Format-List | Out-String) + '</pre>' + $Tail
-Send-MessageToTelegramChatViaBot -BotToken 'YYYYYYYYYYYYYYYYYYYYYYY' -ChatId 'XXXXXXXXXXXXXXXXXXX' -Message $Message
+Send-MessageToTelegramChatViaBot -BotToken 'XXX' -ChatId 'YYY' -Message $Message
+#Endregion Main Script
