@@ -7,14 +7,14 @@ function Get-VBRLatestRestorePointDate { # Получает дату после�
         $VBRBackupName,
 
         [Parameter(Mandatory = $true, Position = 1)]
-        [ValidateSet('VMware Backup', 'File Backup', 'Linux Agent Backup')] # Другие типы бекапов добавлю по мере необходимости
+        [ValidateSet('VMware Backup', 'File Backup', 'Linux Agent Backup', 'Hyper-V Backup')] # Другие типы бекапов добавлю по мере необходимости
         [System.String]
         $VBRBackupType
     )
 
     $InputDateFormat = 'MM/d/yyyy h:mm:ss tt'
 
-    if ($VBRBackupType -eq 'VMware Backup') {
+    if (@('VMware Backup', 'Hyper-V Backup') -contains $VBRBackupType) {
         $result = try {
             Get-Date(
                 [datetime]::parseexact(
