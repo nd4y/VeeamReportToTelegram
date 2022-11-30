@@ -70,27 +70,29 @@ function Get-VBRRecoveryPointObjective { #Выводит округленное 
 
     return $result
 }
-function Add-EmojiAtTheBegginingOfTheString { #Добавляет URL encoded Emoji для Telegram
-    param (
+function Get-FormattedRPO { # Конвертирует значение RPO в строку с Emoji
+    Param(
         [Parameter(Mandatory = $true, Position = 0)]
-        [String]
-        $String,
-
+        [int]
+        $RPO,
         [Parameter(Mandatory = $true, Position = 1)]
-        [ValidateSet('Green', 'Yellow', 'Red')]
-        [String]
-        $Color
-        )
-        
-    $EmojiMap = @{
-        'Green'     = '%E2%9C%85'
-        'Yellow'    = '%E2%9A%A0%EF%B8%8F'
-        'Red'       = '%E2%9D%8C'
-    }
-    
-    $result = $EmojiMap.$Color + $String
+        [hashtable]
+        $RPOMap
+    )
 
+    foreach ($Element in ($RPOMap.GetEnumerator() | Sort-Object -Property 'Key')) {
+        if ($RPO -le $Element.Key) {
+            $Color = $Element.Value
+            break
+        }
+        else {
+            $Color = 'Red'
+        }
+    }
+
+    $result = Add-EmojiAtTheBegginingOfTheString -Color $Color -String ("$RPO" + 'h')
     return $result
+    
 }
 function Send-MessageToTelegramChatViaBot { # Отправляет сообщение в телеграм. 
     param (
@@ -154,30 +156,6 @@ function Get-FormattedDate { # Конвертирует дату из datetime �
     return $result
     
 }
-function Get-FormattedRPO { # Конвертирует значение RPO в строку с Emoji
-    Param(
-        [Parameter(Mandatory = $true, Position = 0)]
-        [int]
-        $RPO,
-        [Parameter(Mandatory = $true, Position = 1)]
-        [hashtable]
-        $RPOMap
-    )
-
-    foreach ($Element in ($RPOMap.GetEnumerator() | Sort-Object -Property 'Key')) {
-        if ($RPO -le $Element.Key) {
-            $Color = $Element.Value
-            break
-        }
-        else {
-            $Color = 'Red'
-        }
-    }
-
-    $result = Add-EmojiAtTheBegginingOfTheString -Color $Color -String ("$RPO" + 'h')
-    return $result
-    
-}
 function Get-FormattedLastResult { # Конвертирует значение статуса в строку с Emoji
     Param(
         [Parameter(Mandatory = $true, Position = 0)]
@@ -235,6 +213,28 @@ function Get-VBRJobTotalBackupSize { # Расчитывает значение �
         }
     }
     return $result 
+}
+function Add-EmojiAtTheBegginingOfTheString { #Добавляет URL encoded Emoji для Telegram
+    param (
+        [Parameter(Mandatory = $true, Position = 0)]
+        [String]
+        $String,
+
+        [Parameter(Mandatory = $true, Position = 1)]
+        [ValidateSet('Green', 'Yellow', 'Red')]
+        [String]
+        $Color
+        )
+        
+    $EmojiMap = @{
+        'Green'     = '%E2%9C%85'
+        'Yellow'    = '%E2%9A%A0%EF%B8%8F'
+        'Red'       = '%E2%9D%8C'
+    }
+    
+    $result = $EmojiMap.$Color + $String
+
+    return $result
 }
 #endregion Functions
 
