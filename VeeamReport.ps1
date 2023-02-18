@@ -1,9 +1,13 @@
+﻿param (
+    [Parameter(Position=0,mandatory=$false)]
+    [string]$ConfigPath = "C:\scripts\VeeamReport.conf"
+)
 $error.Clear()
 #region Functions
 function Get-VBRLatestRestorePointDate { # Получает дату последней точки восстановления
     param (
         [Parameter(Mandatory = $true, Position = 0)]
-        [System.String]$VBRBackupName,
+        [System.String]$VBRBackupJobName,
         [Parameter(Mandatory = $true, Position = 1)]
         [ValidateSet('VMware Backup', 'File Backup', 'Linux Agent Backup', 'Hyper-V Backup', 'Backup Copy', 'Hyper-V Backup Copy')] # Другие типы бекапов добавлю по мере необходимости
         [System.String]$VBRBackupType
@@ -14,7 +18,7 @@ function Get-VBRLatestRestorePointDate { # Получает дату после�
             $result = try {
                 Get-Date(
                     [datetime]::parseexact(
-                        (Get-VBRJob -Name $VBRBackupName).GetLastBackup().LastPointCreationTime, $InputDateFormat, $null
+                        (Get-VBRJob -Name $VBRBackupJobName).GetLastBackup().LastPointCreationTime, $InputDateFormat, $null
                     )
                 )
             }
@@ -26,7 +30,7 @@ function Get-VBRLatestRestorePointDate { # Получает дату после�
             $result = try {
                 Get-Date(
                     [datetime]::parseexact(
-                        (Get-VBRJob -Name $VBRBackupName).GetLastBackup().LastPointCreationTime, $InputDateFormat, $null
+                        (Get-VBRJob -Name $VBRBackupJobName).GetLastBackup().LastPointCreationTime, $InputDateFormat, $null
                     )
                 )
             }
@@ -37,17 +41,27 @@ function Get-VBRLatestRestorePointDate { # Получает дату после�
         'File Backup' {
             $result = try {
                 Get-Date(
-                    (Get-VBRNASBackup -Name $VBRBackupName).LastRestorePointCreationTime
+                    (Get-VBRNASBackup -Name $VBRBackupJobName).LastRestorePointCreationTime | Sort-Object -Descending | Select-Object -First 1
                     )
             }
             catch {
                 'No restore points'
             }
         }
+        'Backup Copy' {
+            $result = try {
+                Get-Date(
+                    (Get-VBRJob -Name $VBRBackupJobName).GetLastBackup().MetaUpdateTime
+                    )
+            }
+            catch {
+                'No restore points'
+            } 
+        }
         default {
             $result = try {
                 Get-Date(
-                    (Get-VBRJob -Name $VBRBackupName).GetLastBackup().CreationTime
+                    (Get-VBRJob -Name $VBRBackupJobName).GetLastBackup().CreationTime
                     )
             }
             catch {
@@ -89,6 +103,39 @@ function Get-FormattedRPO { # Конвертирует значение RPO в �
         }
     }
     $result = Add-EmojiAtTheBegginingOfTheString -Color $Color -String ("$RPO" + 'h')
+    return $result
+}
+function Import-Config { #Импортирует параметры скрипта и проверяет наличие обязательных параметров.
+    param (
+        [Parameter(Position=0,mandatory=$true)]
+        [string]$ConfigPath
+    )
+    try {
+        $result = @{}
+        Get-Content -Path $ConfigPath | Foreach-Object {
+            if ($_.Split('=')[0] -notmatch "^;|#.*") { # Исключить закомментированные строки
+                $result += [hashtable]@{
+                    $_.Split('=')[0] = $_.Split('=')[1]
+                }
+            }
+        }
+    }
+    catch {
+        break
+    }
+    #region Precheck Imported Params
+    $RequiredParamsList = @(
+        'TelegramBotToken'
+        'TelegramChatId'
+    )
+    $RequiredParamsList | ForEach-Object {
+        if ($result.GetEnumerator().Name -contains $_) {
+        }
+        else {
+            break
+        } 
+    }
+    #endregion Precheck Imported Params
     return $result
 }
 function Send-MessageToTelegramChatViaBot { # Отправляет сообщение в телеграм. 
@@ -174,20 +221,31 @@ function Get-VBRJobTotalBackupSize { # Расчитывает значение �
         [Parameter(Mandatory = $true, Position = 1)]
         [String]$VBRBackupType
     )
-    if ($VBRBackupType -eq 'File Backup') {
-        $result = try {
-            (Get-VBRJob -Name $VBRBackupJobName).FindLastSession().Info.BackupTotalSize
+
+    switch ($VBRBackupType) {
+        'File Backup' {
+            $result = try {
+                (Get-VBRJob -Name $VBRBackupJobName).FindLastSession().Info.BackupTotalSize
+            }
+            catch {
+                $_
+            }
         }
-        catch {
-            $_
+        'Backup Copy' {
+            $result = try {
+                (Get-VBRNASBackupCopyJob -Name $VBRBackupJobName).FindLastSession().Info.Progress.TotalUsedSize
+            }
+            catch {
+                $_
+            }
         }
-    }
-    else {
-        $result = try {
-            (((Get-VBRBackup -Name "$VBRBackupJobName*").GetAllStorages().Stats.BackupSize) | Measure-Object -Sum).Sum
-        }
-        catch {
-            $_
+        default {
+            $result = try {
+                (((Get-VBRBackup -Name "$VBRBackupJobName*").GetAllStorages().Stats.BackupSize) | Measure-Object -Sum).Sum
+            }
+            catch {
+                $_
+            }
         }
     }
     return $result 
@@ -230,10 +288,11 @@ Get-VBRJob | ForEach-Object {
     #endregion Custom RPO Settings
     $BackupStatistics += [PSCustomObject]@{
         'Name'                        = $_.Name 
-        'RPO'                         = Get-FormattedRPO -RPO (Get-VBRRecoveryPointObjective -LatestRestorePointDate (Get-VBRLatestRestorePointDate -VBRBackupName $_.Name -VBRBackupType $_.TypeToString)) -RPOMap $RPOMap
+        'Job Type'                    = $_.TypeToString
         'Job status'                  = $_.GetLastState()
+        'RPO'                         = Get-FormattedRPO -RPO (Get-VBRRecoveryPointObjective -LatestRestorePointDate (Get-VBRLatestRestorePointDate -VBRBackupJobName $_.Name -VBRBackupType $_.TypeToString)) -RPOMap $RPOMap
         'Last result'                 = Get-FormattedLastResult -LastResult ($_.Info.LatestStatus)
-        'Latest restore point'        = Get-FormattedDate -InputDate (Get-VBRLatestRestorePointDate -VBRBackupName $_.Name -VBRBackupType $_.TypeToString)
+        'Latest restore point'        = Get-FormattedDate -InputDate (Get-VBRLatestRestorePointDate -VBRBackupJobName $_.Name -VBRBackupType $_.TypeToString)
         'Total backup size'           = "$([math]::round((Get-VBRJobTotalBackupSize -VBRBackupJobName $_.Name -VBRBackupType $_.TypeToString)/1GB))GB"
     }
 }
@@ -241,5 +300,5 @@ $BackupStatistics
 $Header  = 'Veeam backup report for ' + (Get-FormattedDate -InputDate (Get-Date))
 $Tail    = '[DEBUG] Number of data processing errors: ' + $error.Count 
 $Message = $Header + '<pre>' + $($BackupStatistics | Sort-Object -Property 'Name' | Format-List | Out-String) + '</pre>' + $Tail
-Send-MessageToTelegramChatViaBot -BotToken 'XXX' -ChatId 'YYY' -Message $Message
+Send-MessageToTelegramChatViaBot -BotToken $((Import-Config -ConfigPath $ConfigPath).TelegramBotToken) -ChatId $((Import-Config -ConfigPath $ConfigPath).TelegramChatId) -Message $Message
 #Endregion Main Script
