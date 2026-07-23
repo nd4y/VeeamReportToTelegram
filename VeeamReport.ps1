@@ -113,10 +113,10 @@ function Import-Config { #Импортирует параметры скрипт
     try {
         $result = @{}
         Get-Content -Path $ConfigPath | Foreach-Object {
+            if ($_.Trim() -eq '') { return } # Пропустить пустые строки
             if ($_.Split('=')[0] -notmatch "^;|#.*") { # Исключить закомментированные строки
-                $result += [hashtable]@{
-                    $_.Split('=')[0] = $_.Split('=')[1]
-                }
+                $Key, $Value = $_.Split('=', 2) # Разбить только по первому "=", чтобы не портить JSON-значения
+                $result[$Key] = $Value
             }
         }
     }
@@ -133,10 +133,37 @@ function Import-Config { #Импортирует параметры скрипт
         }
         else {
             break
-        } 
+        }
     }
     #endregion Precheck Imported Params
     return $result
+}
+function ConvertTo-OrderedHashtable { # Конвертирует PSCustomObject (например, результат ConvertFrom-Json) в упорядоченный hashtable
+    param (
+        [Parameter(Mandatory = $true, Position = 0)]
+        [PSCustomObject]$InputObject
+    )
+    $result = [ordered]@{}
+    foreach ($Property in $InputObject.PSObject.Properties) {
+        $result[$Property.Name] = $Property.Value
+    }
+    return $result
+}
+function Import-CustomRPOMap { # Парсит CustomRPOMap из JSON-строки в конфиге в массив объектов, ожидаемых Get-FormattedRPO
+    param (
+        [Parameter(Mandatory = $false, Position = 0)]
+        [string]$CustomRPOMapJson
+    )
+    if ([string]::IsNullOrWhiteSpace($CustomRPOMapJson)) {
+        return @()
+    }
+    $result = ConvertFrom-Json -InputObject $CustomRPOMapJson | ForEach-Object {
+        [PSCustomObject]@{
+            JobName = $_.JobName
+            RPOMap  = ConvertTo-OrderedHashtable -InputObject $_.RPOMap
+        }
+    }
+    return @($result)
 }
 function Send-MessageToTelegramChatViaBot { # Отправляет сообщение в телеграм. 
     param (
@@ -267,7 +294,9 @@ function Add-EmojiAtTheBegginingOfTheString { #Добавляет URL encoded Em
     return $result
 }
 #endregion Functions
-#Main Script        
+#Main Script
+$Config = Import-Config -ConfigPath $ConfigPath
+$CustomRPOMap = Import-CustomRPOMap -CustomRPOMapJson $Config.CustomRPOMap # Переопределение дефолтного RPO (24 часа) для некоторых видов бекапов, задаётся в конфиге
 $BackupStatistics = @()
 Get-VBRJob | ForEach-Object {
     $RPOMap = [ordered]@{ # Максимально допустимое время в часах для получения зеленого, желтого или красного значка напротив значения RPO. Красный значек используется, если не выполняются условия для зеленого или желтого.
@@ -276,10 +305,6 @@ Get-VBRJob | ForEach-Object {
         #'999999'    = 'Red'
     }
     #region Custom RPO Settings
-    $CustomRPOMap = @( # Переопределение дефолтного RPO (24 часа) для некоторых видов бекапов
-        [PSCustomObject]@{JobName = 'Custom Backup';   RPOMap = [ordered]@{'168' = 'Green'; '336' = 'Yellow'}}
-        [PSCustomObject]@{JobName = 'Custom 2 Backup'; RPOMap = [ordered]@{'9998' = 'Green'; '9999' = 'Yellow'}}
-    )
     foreach ($Element in $CustomRPOMap) {
         if ($_.Name -eq $Element.JobName) {
             $RPOMap = $Element.RPOMap
@@ -300,5 +325,5 @@ $BackupStatistics
 $Header  = 'Veeam backup report for ' + (Get-FormattedDate -InputDate (Get-Date))
 $Tail    = '[DEBUG] Number of data processing errors: ' + $error.Count 
 $Message = $Header + '<pre>' + $($BackupStatistics | Sort-Object -Property 'Name' | Format-List | Out-String) + '</pre>' + $Tail
-Send-MessageToTelegramChatViaBot -BotToken $((Import-Config -ConfigPath $ConfigPath).TelegramBotToken) -ChatId $((Import-Config -ConfigPath $ConfigPath).TelegramChatId) -Message $Message
+Send-MessageToTelegramChatViaBot -BotToken $Config.TelegramBotToken -ChatId $Config.TelegramChatId -Message $Message
 #Endregion Main Script
