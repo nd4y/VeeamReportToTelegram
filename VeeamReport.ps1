@@ -222,6 +222,33 @@ function ConvertTo-TelegramHtmlText { # Экранирует спецсимво�
     $result = $Text.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
     return $result
 }
+function Get-ReportTextBlocks { # Собирает текстовые блоки отчёта: сначала задания, затем раздел бекапов без задания
+    param (
+        [Parameter(Mandatory = $false, Position = 0)]
+        [array]$JobStatistics = @(),
+        [Parameter(Mandatory = $false, Position = 1)]
+        [array]$OrphanedStatistics = @(),
+        [Parameter(Mandatory = $false, Position = 2)]
+        [String]$OrphanedSectionHeader = '--- Backups without a job (RPO not calculated) ---'
+    )
+    $result = @(
+        $JobStatistics | Sort-Object -Property 'Name' | ForEach-Object {
+            ConvertTo-TelegramHtmlText -Text ($_ | Format-List | Out-String).Trim()
+        }
+    )
+    if ($OrphanedStatistics.Count) {
+        $OrphanedBlocks = @(
+            $OrphanedStatistics | Sort-Object -Property 'Name' | ForEach-Object {
+                ConvertTo-TelegramHtmlText -Text ($_ | Format-List | Out-String).Trim()
+            }
+        )
+        # Заголовок приклеивается к первому блоку раздела, а не идёт отдельным блоком: иначе при
+        # разбиении на сообщения он мог бы оказаться последней строкой чанка, оторванной от раздела
+        $OrphanedBlocks[0] = (ConvertTo-TelegramHtmlText -Text $OrphanedSectionHeader) + "`n`n" + $OrphanedBlocks[0]
+        $result += $OrphanedBlocks
+    }
+    return $result
+}
 function Split-MessageIntoChunks { # Разбивает блоки текста на части, каждая из которых влезает в одно сообщение Telegram
     param (
         [Parameter(Mandatory = $false, Position = 0)]
@@ -432,7 +459,7 @@ catch {
     Write-Host "Failed to get NAS backups: $($_.Exception.Message)"
 }
 $BackupStatistics = @()
-$BackupStatistics += foreach ($VBRJob in $AllVBRJobs) {
+$BackupStatistics += foreach ($VBRJob in $AllVBRJobs) { # Задания: полный набор колонок, включая RPO
     $VBRBackup = Get-VBRBackupForJob -VBRBackupJob $VBRJob -VBRBackupList $AllVBRBackups -VBRNASBackupList $AllVBRNASBackups
     $LatestRestorePointDate = Get-VBRLatestRestorePointDate -VBRBackup $VBRBackup -VBRBackupJob $VBRJob # Получается один раз и используется и для расчета RPO, и для вывода в отчет
     $TotalBackupSize = Get-VBRBackupTotalSize -VBRBackup $VBRBackup -VBRBackupJob $VBRJob
@@ -453,11 +480,15 @@ $BackupStatistics += foreach ($VBRJob in $AllVBRJobs) {
     }
 }
 #region Backups without a job
+# Идут отдельным разделом и без RPO: RPO - это отставание от расписания, а расписания у бекапа
+# без задания нет. Показывать по нему красный значок бессмысленно - обновляться он уже не будет.
+# По той же причине пропущены "Job status" и "Last result": запусков, о которых можно сообщить, нет.
+$OrphanedStatistics = @()
 if ($IncludeBackupsWithoutJob) {
     $JobIds = @($AllVBRJobs | ForEach-Object { [string]$_.Id })
     $JobNames = @($AllVBRJobs | ForEach-Object { $_.Name })
     $OrphanedBackups = @($AllVBRBackups | Where-Object { ([string]$_.JobId) -notin $JobIds -and $_.Name -notin $JobNames })
-    $BackupStatistics += foreach ($VBRBackup in $OrphanedBackups) {
+    $OrphanedStatistics += foreach ($VBRBackup in $OrphanedBackups) {
         $LatestRestorePointDate = Get-VBRLatestRestorePointDate -VBRBackup $VBRBackup
         $TotalBackupSize = Get-VBRBackupTotalSize -VBRBackup $VBRBackup
         if ($null -ne $TotalBackupSize) {
@@ -468,10 +499,8 @@ if ($IncludeBackupsWithoutJob) {
         }
         [PSCustomObject]@{
             'Name'                        = $VBRBackup.Name
-            'Job Type'                    = [string]$VBRBackup.TypeToString
-            'Job status'                  = 'No job'
-            'RPO'                         = Get-FormattedRPO -RPO (Get-VBRRecoveryPointObjective -LatestRestorePointDate $LatestRestorePointDate) -RPOMap (Get-RPOMapForName -Name $VBRBackup.Name -DefaultRPOMap $DefaultRPOMap -CustomRPOMap $CustomRPOMap)
-            'Last result'                 = Get-FormattedLastResult -LastResult 'Unknown'
+            'Backup Type'                 = [string]$VBRBackup.TypeToString
+            'Repository'                  = $(try { $VBRBackup.GetRepository().Name } catch { 'Unknown' })
             'Latest restore point'        = Get-FormattedDate -InputDate $LatestRestorePointDate
             'Total backup size'           = $TotalBackupSizeFormatted
         }
@@ -479,13 +508,10 @@ if ($IncludeBackupsWithoutJob) {
 }
 #endregion Backups without a job
 $BackupStatistics
+$OrphanedStatistics
 $Header  = 'Veeam backup report for ' + (Get-FormattedDate -InputDate (Get-Date))
 $Tail    = '[DEBUG] Number of data processing errors: ' + $error.Count
-$JobTextBlocks = @(
-    $BackupStatistics | Sort-Object -Property 'Name' | ForEach-Object {
-        ConvertTo-TelegramHtmlText -Text ($_ | Format-List | Out-String).Trim()
-    }
-)
+$JobTextBlocks = @(Get-ReportTextBlocks -JobStatistics $BackupStatistics -OrphanedStatistics $OrphanedStatistics)
 $MessageChunks = @(Split-MessageIntoChunks -TextBlocks $JobTextBlocks) # Отчет длиннее лимита Telegram уходит несколькими сообщениями
 if ($MessageChunks.Count -eq 0) {
     if ($DataCollectionError) {
