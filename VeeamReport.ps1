@@ -350,13 +350,12 @@ function Get-VBRBackupTotalSize { # Считает суммарный разме
         [Parameter(Mandatory = $false, Position = 1)]
         $VBRBackupJob
     )
-    if ($VBRBackupJob -and $VBRBackupJob.JobType -in 'NasBackup', 'NasBackupCopy') { # У NAS-заданий размер берётся из последней сессии: у объекта бекапа storages нет
+    if ($VBRBackupJob -and $VBRBackupJob.JobType -in 'NasBackup', 'NasBackupCopy') {
+        # У NAS-заданий размер берётся из последней сессии: у VBRNASBackup нет ни storages, ни свойств размера.
+        # Именно BackupTotalSize, а не Progress.TotalUsedSize: последний равен ProcessedSize, то есть объёму,
+        # обработанному за конкретный запуск. На инкрементальном запуске копии он давал 507GB вместо 1750GB.
         try {
-            $NASSession = $VBRBackupJob.FindLastSession()
-            if ($VBRBackupJob.JobType -eq 'NasBackupCopy') {
-                return $NASSession.Info.Progress.TotalUsedSize
-            }
-            return $NASSession.Info.BackupTotalSize
+            return $VBRBackupJob.FindLastSession().Info.BackupTotalSize
         }
         catch {
             return $null
