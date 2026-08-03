@@ -44,6 +44,37 @@ function Get-VBRBackupForJob { # Находит объект бекапа, пр�
     }
     return $result
 }
+function Get-VBRRepositoryName { # Определяет репозиторий, в котором лежит бекап
+    param (
+        [Parameter(Mandatory = $false, Position = 0)]
+        $VBRBackup,
+        [Parameter(Mandatory = $false, Position = 1)]
+        $VBRBackupJob
+    )
+    # Сначала спрашиваем бекап: он знает, где данные лежат сейчас, а задание - только куда
+    # настроено писать. У VBRNASBackup метода нет, для NAS-заданий срабатывает вторая ветка.
+    if ($VBRBackup -and ($VBRBackup.PSObject.Methods.Name -contains 'GetRepository')) {
+        try {
+            $Name = $VBRBackup.GetRepository().Name
+            if ($Name) {
+                return $Name
+            }
+        }
+        catch {
+        }
+    }
+    if ($VBRBackupJob -and ($VBRBackupJob.PSObject.Methods.Name -contains 'GetTargetRepository')) {
+        try {
+            $Name = $VBRBackupJob.GetTargetRepository().Name
+            if ($Name) {
+                return $Name
+            }
+        }
+        catch {
+        }
+    }
+    return 'Unknown'
+}
 function Get-VBRLatestRestorePointDate { # Получает дату последней точки восстановления по самим точкам, а не по метаданным задания
     param (
         [Parameter(Mandatory = $false, Position = 0)]
@@ -229,7 +260,7 @@ function Get-ReportTextBlocks { # Собирает текстовые блоки
         [Parameter(Mandatory = $false, Position = 1)]
         [array]$OrphanedStatistics = @(),
         [Parameter(Mandatory = $false, Position = 2)]
-        [String]$OrphanedSectionHeader = '--- Backups without a job (RPO not calculated) ---'
+        [String]$OrphanedSectionHeader = '--- Backups without a job ---'
     )
     $result = @(
         $JobStatistics | Sort-Object -Property 'Name' | ForEach-Object {
@@ -477,6 +508,7 @@ $BackupStatistics += foreach ($VBRJob in $AllVBRJobs) { # Задания: пол
         'Last result'                 = Get-FormattedLastResult -LastResult ($VBRJob.Info.LatestStatus)
         'Latest restore point'        = Get-FormattedDate -InputDate $LatestRestorePointDate
         'Total backup size'           = $TotalBackupSizeFormatted
+        'Repository'                  = Get-VBRRepositoryName -VBRBackup $VBRBackup -VBRBackupJob $VBRJob
     }
 }
 #region Backups without a job
@@ -500,9 +532,9 @@ if ($IncludeBackupsWithoutJob) {
         [PSCustomObject]@{
             'Name'                        = $VBRBackup.Name
             'Backup Type'                 = [string]$VBRBackup.TypeToString
-            'Repository'                  = $(try { $VBRBackup.GetRepository().Name } catch { 'Unknown' })
             'Latest restore point'        = Get-FormattedDate -InputDate $LatestRestorePointDate
             'Total backup size'           = $TotalBackupSizeFormatted
+            'Repository'                  = Get-VBRRepositoryName -VBRBackup $VBRBackup
         }
     }
 }
