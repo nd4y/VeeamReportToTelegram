@@ -25,48 +25,109 @@ function ConvertTo-DateTime { # Приводит значение к [datetime].
     }
     throw "Cannot parse date '$InputDateString'"
 }
-function Get-VBRLatestRestorePointDate { # Получает дату последней точки восстановления
+function Get-VBRBackupForJob { # Находит объект бекапа, принадлежащий заданию. NAS-задания живут в отдельном списке Get-VBRNASBackup
     param (
         [Parameter(Mandatory = $true, Position = 0)]
-        $VBRBackupJob # Объект задания из Get-VBRJob. Типы заданий без особой обработки идут через ветку default
+        $VBRBackupJob,
+        [Parameter(Mandatory = $false, Position = 1)]
+        [array]$VBRBackupList = @(),
+        [Parameter(Mandatory = $false, Position = 2)]
+        [array]$VBRNASBackupList = @()
     )
-    switch ($VBRBackupJob.TypeToString) {
-        { $_ -in 'VMware Backup', 'Hyper-V Backup' } {
-            $result = try {
-                ConvertTo-DateTime -InputDate $VBRBackupJob.GetLastBackup().LastPointCreationTime
-            }
-            catch {
-                'No restore points'
+    $SearchList = $VBRBackupList
+    if ($VBRBackupJob.JobType -in 'NasBackup', 'NasBackupCopy') {
+        $SearchList = $VBRNASBackupList
+    }
+    $result = @($SearchList | Where-Object { $_.JobId -eq $VBRBackupJob.Id }) | Select-Object -First 1
+    if (-not $result) {
+        $result = @($SearchList | Where-Object { $_.Name -eq $VBRBackupJob.Name }) | Select-Object -First 1 # Фолбек по имени: у части бекапов JobId не заполнен
+    }
+    return $result
+}
+function Get-VBRRepositoryName { # Определяет репозиторий, в котором лежит бекап
+    param (
+        [Parameter(Mandatory = $false, Position = 0)]
+        $VBRBackup,
+        [Parameter(Mandatory = $false, Position = 1)]
+        $VBRBackupJob
+    )
+    # Сначала спрашиваем бекап: он знает, где данные лежат сейчас, а задание - только куда
+    # настроено писать. У VBRNASBackup метода нет, для NAS-заданий срабатывает вторая ветка.
+    if ($VBRBackup -and ($VBRBackup.PSObject.Methods.Name -contains 'GetRepository')) {
+        try {
+            $Name = $VBRBackup.GetRepository().Name
+            if ($Name) {
+                return $Name
             }
         }
-        'File Backup' {
-            $result = try {
-                ConvertTo-DateTime -InputDate (
-                    (Get-VBRNASBackup -Name $VBRBackupJob.Name).LastRestorePointCreationTime | Sort-Object -Descending | Select-Object -First 1
-                    )
-            }
-            catch {
-                'No restore points'
+        catch {
+        }
+    }
+    if ($VBRBackupJob -and ($VBRBackupJob.PSObject.Methods.Name -contains 'GetTargetRepository')) {
+        try {
+            $Name = $VBRBackupJob.GetTargetRepository().Name
+            if ($Name) {
+                return $Name
             }
         }
-        'Backup Copy' {
-            $result = try {
-                ConvertTo-DateTime -InputDate $VBRBackupJob.GetLastBackup().MetaUpdateTime
+        catch {
+        }
+    }
+    return 'Unknown'
+}
+function Get-VBRLatestRestorePointDate { # Получает дату последней точки восстановления по самим точкам, а не по метаданным задания
+    param (
+        [Parameter(Mandatory = $false, Position = 0)]
+        $VBRBackup, # Объект бекапа из Get-VBRBackup или Get-VBRNASBackup
+        [Parameter(Mandatory = $false, Position = 1)]
+        $VBRBackupJob # Задание нужно только для фолбеков по метаданным
+    )
+    # Точки восстановления - единственный надёжный источник даты. Метаданные задания врут:
+    # LastPointCreationTime у многих заданий пустой, а MetaUpdateTime у Backup Copy в объектное
+    # хранилище остаётся на дате создания задания и даёт RPO в тысячи часов при живых бекапах.
+    if ($VBRBackup) {
+        $IsNASBackup = ($VBRBackup.PSObject.Properties.Name -contains 'LastRestorePointCreationTime') # Свойство есть только у VBRNASBackup, у обычного CBackup его нет
+        $RestorePoints = @()
+        try {
+            if (-not $IsNASBackup) {
+                $RestorePoints = @(Get-VBRRestorePoint -Backup $VBRBackup -ErrorAction Stop)
             }
-            catch {
-                'No restore points'
+            elseif (Get-Command -Name 'Get-VBRUnstructuredBackupRestorePoint' -ErrorAction SilentlyContinue) {
+                $RestorePoints = @(Get-VBRUnstructuredBackupRestorePoint -Backup $VBRBackup -ErrorAction Stop)
+            }
+            else {
+                $RestorePoints = @(Get-VBRNASBackupRestorePoint -NASBackup $VBRBackup -ErrorAction Stop) # Фолбек для Veeam, где ещё нет Unstructured-командлетов
             }
         }
-        default {
-            $result = try {
-                ConvertTo-DateTime -InputDate $VBRBackupJob.GetLastBackup().CreationTime
+        catch {
+            $RestorePoints = @()
+        }
+        $LatestPoint = $RestorePoints | Sort-Object -Property 'CreationTime' -Descending | Select-Object -First 1
+        if ($LatestPoint -and $LatestPoint.CreationTime) {
+            try {
+                return ConvertTo-DateTime -InputDate $LatestPoint.CreationTime
             }
             catch {
-                'No restore points'
+            }
+        }
+        foreach ($FallbackProperty in 'LastRestorePointCreationTime', 'LastPointCreationTime') { # Фолбек для версий Veeam, где командлеты точек недоступны
+            if ($VBRBackup.$FallbackProperty) {
+                try {
+                    return ConvertTo-DateTime -InputDate $VBRBackup.$FallbackProperty
+                }
+                catch {
+                }
             }
         }
     }
-    return $result
+    if ($VBRBackupJob) {
+        try {
+            return ConvertTo-DateTime -InputDate $VBRBackupJob.FindLastSession().EndTime # Последний фолбек: время завершения последней сессии
+        }
+        catch {
+        }
+    }
+    return 'No restore points'
 }
 function Get-VBRRecoveryPointObjective { #Выводит округленное время в часах между текущей датой и переданной в параметре датой
     param (
@@ -166,6 +227,23 @@ function Import-CustomRPOMap { # Парсит CustomRPOMap из JSON-строк�
     }
     return @($result | Where-Object { $null -ne $_ })
 }
+function Get-RPOMapForName { # Подбирает пороги RPO для конкретного задания: кастомные, если имя совпало, иначе дефолтные
+    param (
+        [Parameter(Mandatory = $true, Position = 0)]
+        [AllowEmptyString()]
+        [string]$Name,
+        [Parameter(Mandatory = $true, Position = 1)]
+        $DefaultRPOMap,
+        [Parameter(Mandatory = $false, Position = 2)]
+        [array]$CustomRPOMap = @()
+    )
+    foreach ($Element in $CustomRPOMap) {
+        if ($Name -eq $Element.JobName) {
+            return $Element.RPOMap
+        }
+    }
+    return $DefaultRPOMap
+}
 function ConvertTo-TelegramHtmlText { # Экранирует спецсимволы HTML, иначе Telegram отбрасывает сообщение с parse_mode=html
     param (
         [Parameter(Mandatory = $false, Position = 0)]
@@ -173,6 +251,33 @@ function ConvertTo-TelegramHtmlText { # Экранирует спецсимво�
         [String]$Text = ''
     )
     $result = $Text.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    return $result
+}
+function Get-ReportTextBlocks { # Собирает текстовые блоки отчёта: сначала задания, затем раздел бекапов без задания
+    param (
+        [Parameter(Mandatory = $false, Position = 0)]
+        [array]$JobStatistics = @(),
+        [Parameter(Mandatory = $false, Position = 1)]
+        [array]$OrphanedStatistics = @(),
+        [Parameter(Mandatory = $false, Position = 2)]
+        [String]$OrphanedSectionHeader = '--- Backups without a job ---'
+    )
+    $result = @(
+        $JobStatistics | Sort-Object -Property 'Name' | ForEach-Object {
+            ConvertTo-TelegramHtmlText -Text ($_ | Format-List | Out-String).Trim()
+        }
+    )
+    if ($OrphanedStatistics.Count) {
+        $OrphanedBlocks = @(
+            $OrphanedStatistics | Sort-Object -Property 'Name' | ForEach-Object {
+                ConvertTo-TelegramHtmlText -Text ($_ | Format-List | Out-String).Trim()
+            }
+        )
+        # Заголовок приклеивается к первому блоку раздела, а не идёт отдельным блоком: иначе при
+        # разбиении на сообщения он мог бы оказаться последней строкой чанка, оторванной от раздела
+        $OrphanedBlocks[0] = (ConvertTo-TelegramHtmlText -Text $OrphanedSectionHeader) + "`n`n" + $OrphanedBlocks[0]
+        $result += $OrphanedBlocks
+    }
     return $result
 }
 function Split-MessageIntoChunks { # Разбивает блоки текста на части, каждая из которых влезает в одно сообщение Telegram
@@ -296,48 +401,40 @@ function Get-FormattedLastResult { # Конвертирует значение �
     $result = Add-EmojiAtTheBeginningOfTheString -Color $Color -String $LastResult
     return $result
 }
-function Get-VBRJobTotalBackupSize { # Рассчитывает суммарный размер всех Restore Points в рамках одной Backup Job. Возвращает размер в байтах или $null, если размер получить не удалось
+function Get-VBRBackupTotalSize { # Считает суммарный размер бекапа в байтах. Возвращает $null, если размер получить не удалось
     Param(
-        [Parameter(Mandatory = $true, Position = 0)]
-        $VBRBackupJob,
+        [Parameter(Mandatory = $false, Position = 0)]
+        $VBRBackup,
         [Parameter(Mandatory = $false, Position = 1)]
-        [array]$VBRBackupList = @() # Результат Get-VBRBackup, получается один раз на весь отчет
+        $VBRBackupJob
     )
-    switch ($VBRBackupJob.TypeToString) {
-        'File Backup' {
-            $result = try {
-                $VBRBackupJob.FindLastSession().Info.BackupTotalSize
-            }
-            catch {
-                $null
-            }
+    if ($VBRBackupJob -and $VBRBackupJob.JobType -in 'NasBackup', 'NasBackupCopy') {
+        # У NAS-заданий размер берётся из последней сессии: у VBRNASBackup нет ни storages, ни свойств размера.
+        # Именно BackupTotalSize, а не Progress.TotalUsedSize: последний равен ProcessedSize, то есть объёму,
+        # обработанному за конкретный запуск. На инкрементальном запуске копии он давал 507GB вместо 1750GB.
+        try {
+            return $VBRBackupJob.FindLastSession().Info.BackupTotalSize
         }
-        'Backup Copy' {
-            $result = try {
-                (Get-VBRNASBackupCopyJob -Name $VBRBackupJob.Name).FindLastSession().Info.Progress.TotalUsedSize
-            }
-            catch {
-                $null
-            }
-        }
-        default {
-            $result = try {
-                $JobBackups = @($VBRBackupList | Where-Object { $_.JobId -eq $VBRBackupJob.Id }) # Поиск по JobId вместо маски "Имя*": маска захватывала чужие джобы, имена которых начинаются одинаково
-                if ($JobBackups.Count -eq 0) {
-                    $JobBackups = @($VBRBackupList | Where-Object { $_.Name -like "$($VBRBackupJob.Name)*" }) # Фолбек для бекапов, которые не находятся по JobId (например, дочерние бекапы агентских джоб)
-                }
-                $Sum = ($JobBackups | ForEach-Object { $_.GetAllStorages().Stats.BackupSize } | Measure-Object -Sum).Sum
-                if ($null -eq $Sum) {
-                    $Sum = 0
-                }
-                $Sum
-            }
-            catch {
-                $null
-            }
+        catch {
+            return $null
         }
     }
-    return $result
+    if (-not $VBRBackup) {
+        return $null
+    }
+    # GetAllStorages() возвращает 0 почти для всех бекапов (в том числе для всех в объектном
+    # хранилище) - реальные данные лежат в дочерних бекапах, поэтому основной источник GetAllChildrenStorages()
+    foreach ($Method in 'GetAllChildrenStorages', 'GetAllStorages') {
+        try {
+            $Sum = (($VBRBackup.$Method().Stats.BackupSize) | Measure-Object -Sum).Sum
+            if ($Sum) {
+                return $Sum
+            }
+        }
+        catch {
+        }
+    }
+    return 0
 }
 function Add-EmojiAtTheBeginningOfTheString { #Добавляет Emoji в начало строки
     param (
@@ -363,6 +460,10 @@ $DefaultRPOMap = [ordered]@{ # Максимально допустимое вр�
     '24'        = 'Green'
     '48'        = 'Yellow'
 }
+$IncludeBackupsWithoutJob = $true # Бекапы, у которых не осталось задания (например, агентские), иначе просто исчезают из отчёта вместе со своим RPO
+if ($Config.ContainsKey('IncludeBackupsWithoutJob')) {
+    $IncludeBackupsWithoutJob = ($Config.IncludeBackupsWithoutJob -notmatch '^(false|0|no)$')
+}
 $DataCollectionError = $null
 try {
     $AllVBRJobs = @(Get-VBRJob)
@@ -374,17 +475,25 @@ catch {
     $AllVBRJobs = @()
     $AllVBRBackups = @()
 }
-$BackupStatistics = foreach ($VBRJob in $AllVBRJobs) {
-    $RPOMap = $DefaultRPOMap
-    #region Custom RPO Settings
-    foreach ($Element in $CustomRPOMap) {
-        if ($VBRJob.Name -eq $Element.JobName) {
-            $RPOMap = $Element.RPOMap
-        }
+$AllVBRNASBackups = @()
+try {
+    # NAS-бекапы в Get-VBRBackup не попадают, у них свой список. Get-VBRNASBackup объявлен
+    # устаревшим в пользу Get-VBRUnstructuredBackup и на каждый вызов пишет warning
+    if (Get-Command -Name 'Get-VBRUnstructuredBackup' -ErrorAction SilentlyContinue) {
+        $AllVBRNASBackups = @(Get-VBRUnstructuredBackup)
     }
-    #endregion Custom RPO Settings
-    $LatestRestorePointDate = Get-VBRLatestRestorePointDate -VBRBackupJob $VBRJob # Получается один раз и используется и для расчета RPO, и для вывода в отчет
-    $TotalBackupSize = Get-VBRJobTotalBackupSize -VBRBackupJob $VBRJob -VBRBackupList $AllVBRBackups
+    else {
+        $AllVBRNASBackups = @(Get-VBRNASBackup)
+    }
+}
+catch {
+    Write-Host "Failed to get NAS backups: $($_.Exception.Message)"
+}
+$BackupStatistics = @()
+$BackupStatistics += foreach ($VBRJob in $AllVBRJobs) { # Задания: полный набор колонок, включая RPO
+    $VBRBackup = Get-VBRBackupForJob -VBRBackupJob $VBRJob -VBRBackupList $AllVBRBackups -VBRNASBackupList $AllVBRNASBackups
+    $LatestRestorePointDate = Get-VBRLatestRestorePointDate -VBRBackup $VBRBackup -VBRBackupJob $VBRJob # Получается один раз и используется и для расчета RPO, и для вывода в отчет
+    $TotalBackupSize = Get-VBRBackupTotalSize -VBRBackup $VBRBackup -VBRBackupJob $VBRJob
     if ($null -ne $TotalBackupSize) {
         $TotalBackupSizeFormatted = "$([math]::round($TotalBackupSize/1GB))GB"
     }
@@ -395,20 +504,46 @@ $BackupStatistics = foreach ($VBRJob in $AllVBRJobs) {
         'Name'                        = $VBRJob.Name
         'Job Type'                    = $VBRJob.TypeToString
         'Job status'                  = $VBRJob.GetLastState()
-        'RPO'                         = Get-FormattedRPO -RPO (Get-VBRRecoveryPointObjective -LatestRestorePointDate $LatestRestorePointDate) -RPOMap $RPOMap
+        'RPO'                         = Get-FormattedRPO -RPO (Get-VBRRecoveryPointObjective -LatestRestorePointDate $LatestRestorePointDate) -RPOMap (Get-RPOMapForName -Name $VBRJob.Name -DefaultRPOMap $DefaultRPOMap -CustomRPOMap $CustomRPOMap)
         'Last result'                 = Get-FormattedLastResult -LastResult ($VBRJob.Info.LatestStatus)
         'Latest restore point'        = Get-FormattedDate -InputDate $LatestRestorePointDate
         'Total backup size'           = $TotalBackupSizeFormatted
+        'Repository'                  = Get-VBRRepositoryName -VBRBackup $VBRBackup -VBRBackupJob $VBRJob
     }
 }
+#region Backups without a job
+# Идут отдельным разделом и без RPO: RPO - это отставание от расписания, а расписания у бекапа
+# без задания нет. Показывать по нему красный значок бессмысленно - обновляться он уже не будет.
+# По той же причине пропущены "Job status" и "Last result": запусков, о которых можно сообщить, нет.
+$OrphanedStatistics = @()
+if ($IncludeBackupsWithoutJob) {
+    $JobIds = @($AllVBRJobs | ForEach-Object { [string]$_.Id })
+    $JobNames = @($AllVBRJobs | ForEach-Object { $_.Name })
+    $OrphanedBackups = @($AllVBRBackups | Where-Object { ([string]$_.JobId) -notin $JobIds -and $_.Name -notin $JobNames })
+    $OrphanedStatistics += foreach ($VBRBackup in $OrphanedBackups) {
+        $LatestRestorePointDate = Get-VBRLatestRestorePointDate -VBRBackup $VBRBackup
+        $TotalBackupSize = Get-VBRBackupTotalSize -VBRBackup $VBRBackup
+        if ($null -ne $TotalBackupSize) {
+            $TotalBackupSizeFormatted = "$([math]::round($TotalBackupSize/1GB))GB"
+        }
+        else {
+            $TotalBackupSizeFormatted = 'Unknown'
+        }
+        [PSCustomObject]@{
+            'Name'                        = $VBRBackup.Name
+            'Backup Type'                 = [string]$VBRBackup.TypeToString
+            'Latest restore point'        = Get-FormattedDate -InputDate $LatestRestorePointDate
+            'Total backup size'           = $TotalBackupSizeFormatted
+            'Repository'                  = Get-VBRRepositoryName -VBRBackup $VBRBackup
+        }
+    }
+}
+#endregion Backups without a job
 $BackupStatistics
+$OrphanedStatistics
 $Header  = 'Veeam backup report for ' + (Get-FormattedDate -InputDate (Get-Date))
 $Tail    = '[DEBUG] Number of data processing errors: ' + $error.Count
-$JobTextBlocks = @(
-    $BackupStatistics | Sort-Object -Property 'Name' | ForEach-Object {
-        ConvertTo-TelegramHtmlText -Text ($_ | Format-List | Out-String).Trim()
-    }
-)
+$JobTextBlocks = @(Get-ReportTextBlocks -JobStatistics $BackupStatistics -OrphanedStatistics $OrphanedStatistics)
 $MessageChunks = @(Split-MessageIntoChunks -TextBlocks $JobTextBlocks) # Отчет длиннее лимита Telegram уходит несколькими сообщениями
 if ($MessageChunks.Count -eq 0) {
     if ($DataCollectionError) {
